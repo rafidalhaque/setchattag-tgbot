@@ -1,5 +1,7 @@
-FROM python:3.14-slim
+FROM ghcr.io/astral-sh/uv:python3.14-bookworm-slim
 WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev
 COPY bot.py .
-RUN pip install --no-cache-dir "python-telegram-bot>=22.7" "python-dotenv>=1.0"
-CMD ["python", "bot.py"]
+RUN uv sync --frozen --no-dev
+CMD ["uv", "run", "python", "bot.py"]
