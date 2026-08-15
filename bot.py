@@ -2,8 +2,8 @@
 
 Setup:
   1. pip install -e .
-  2. Copy .env.example to .env, fill BOT_TOKEN and GROUP_CHAT_ID.
-  3. Bot must already be admin in GROUP_CHAT_ID with can_manage_tags -- grant
+  2. Copy .env.example to .env, fill BOT_TOKEN and TARGET_GROUP_ID.
+  3. Bot must already be admin in TARGET_GROUP_ID with can_manage_tags -- grant
      via promoteChatMember(can_manage_tags=True) from another admin account
      first. The bot cannot grant this right to itself.
   4. Run: python bot.py
@@ -39,7 +39,7 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GROUP_CHAT_ID = int(os.environ["GROUP_CHAT_ID"])  # <-- real target group chat_id (set in .env)
+TARGET_GROUP_ID = int(os.environ["TARGET_GROUP_ID"])  # <-- real target group chat_id (set in .env)
 
 DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).with_name("members.db"))))
 
@@ -234,7 +234,7 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_chat.id != GROUP_CHAT_ID:
+    if update.effective_chat.id != TARGET_GROUP_ID:
         return ConversationHandler.END
     old, new = update.chat_member.old_chat_member, update.chat_member.new_chat_member
     if new.status not in ("member", "administrator") or old.status == new.status:
@@ -256,6 +256,18 @@ async def on_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return SELECT_ROLE
 
 
+async def is_group_member(bot, target_group_id: int, user_id: int) -> bool:
+    """Defensive membership check -- any getChatMember failure counts as not-a-member."""
+    try:
+        member = await bot.get_chat_member(target_group_id, user_id)
+    except (BadRequest, Forbidden) as e:
+        logger.info("membership check failed for %s: %s", user_id, e)
+        return False
+    if member.status == "restricted":
+        return bool(member.is_member)
+    return member.status in ("creator", "administrator", "member")
+
+
 async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> None:
     err = validate_tag(tag)
     if err:
@@ -263,14 +275,24 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         return
 
     user = query.from_user
+    if not await is_group_member(context.bot, TARGET_GROUP_ID, user.id):
+        await edit_picker(
+            query,
+            context,
+            "You're not a member of the internal group, so a tag can't be set. "
+            "Contact an admin if you think this is wrong.",
+            None,
+        )
+        return
+
     try:
         if hasattr(context.bot, "set_chat_member_tag"):
-            await context.bot.set_chat_member_tag(GROUP_CHAT_ID, user.id, tag)
+            await context.bot.set_chat_member_tag(TARGET_GROUP_ID, user.id, tag)
         else:
             # ponytail: installed PTB predates the wrapped method, hit the raw API
             await context.bot._post(
                 "setChatMemberTag",
-                {"chat_id": GROUP_CHAT_ID, "user_id": user.id, "tag": tag},
+                {"chat_id": TARGET_GROUP_ID, "user_id": user.id, "tag": tag},
             )
     except Forbidden:
         await edit_picker(
@@ -324,7 +346,7 @@ async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def mytag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     try:
-        member = await context.bot.get_chat_member(GROUP_CHAT_ID, user.id)
+        member = await context.bot.get_chat_member(TARGET_GROUP_ID, user.id)
     except (BadRequest, Forbidden) as e:
         await update.effective_message.reply_text(f"Couldn't look you up: {e}")
         return
