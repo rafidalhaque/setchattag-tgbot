@@ -45,9 +45,47 @@ DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).with_name("members.d
 
 # --- department/role config: edit this to change the menu ------------------
 # dept_code -> (display name, {role_code: role display name})
+
+_COMMON_ROLES: dict[str, str] = {
+    "সম্পাদক": "সম্পাদক",
+    "সহকারী": "সহকারী সম্পাদক",
+    "সদস্য": "সদস্য",
+}
+
 DEPARTMENTS: dict[str, tuple[str, dict[str, str]]] = {
-    "Central": ("কেন্দ্র", {"CP": "কেন্দ্রীয় সভাপতি", "SG": "সেক্রেটারি জেনারেল"}),
-    "IT": ("তথ্যপ্রযুক্তি", {"সম্পাদক": "সম্পাদক", "সহকারী":"সহকারী সম্পাদক", "সদস্য": "সদস্য"}),
+    "কেন্দ্র": ("কেন্দ্র", {"কেন্দ্রীয় সভাপতি": "কেন্দ্রীয় সভাপতি", "সেক্রেটারি জেনারেল": "সেক্রেটারি জেনারেল"}),
+    "দপ্তর": ("দপ্তর", _COMMON_ROLES),
+    "সাহিত্য": ("সাহিত্য", _COMMON_ROLES),
+    "প্রকাশনা": ("প্রকাশনা", _COMMON_ROLES),
+    "দাওয়াহ": ("দাওয়াহ", _COMMON_ROLES),
+    "এইচআরএম": ("এইচআরএম", _COMMON_ROLES),
+    "ফাউন্ডেশন": ("ফাউন্ডেশন", _COMMON_ROLES),
+    "অর্থ": ("অর্থ", _COMMON_ROLES),
+    "কলেজ": ("কলেজ", _COMMON_ROLES),
+    "শিক্ষা": ("শিক্ষা", _COMMON_ROLES),
+    "ব্যবসা": ("ব্যবসা", _COMMON_ROLES),
+    "উচ্চশিক্ষা": ("উচ্চশিক্ষা", _COMMON_ROLES),
+    "গবেষণা": ("গবেষণা", _COMMON_ROLES),
+    "আইটি": ("তথ্যপ্রযুক্তি", _COMMON_ROLES),
+    "শিশু": ("শিশুকল্যাণ", _COMMON_ROLES),
+    "প্রচার": ("প্রচার", _COMMON_ROLES),
+    "সমাজসেবা": ("সমাজসেবা", _COMMON_ROLES),
+    "তথ্য": ("তথ্য", _COMMON_ROLES),
+    "এইচআরডি": ("এইচআরডি", _COMMON_ROLES),
+    "মাদরাসা": ("মাদরাসা", _COMMON_ROLES),
+    "আইন": ("আইন", _COMMON_ROLES),
+    "ছাত্রকল্যাণ": ("ছাত্রকল্যাণ", _COMMON_ROLES),
+    "বিজ্ঞান": ("বিজ্ঞান", _COMMON_ROLES),
+    "স্পোর্টস": ("স্পোর্টস", _COMMON_ROLES),
+    "পিআর": ("পাবলিক রিলেশনস", _COMMON_ROLES),
+    "ছাত্রঅধিকার": ("ছাত্র অধিকার", _COMMON_ROLES),
+    "আন্তর্জাতিক": ("আন্তর্জাতিক", _COMMON_ROLES),
+    "স্কুল": ("স্কুল", _COMMON_ROLES),
+    "পাঠাগার": ("পাঠাগার", _COMMON_ROLES),
+    "মিডিয়া": ("মিডিয়া", _COMMON_ROLES),
+    "প্লানিং": ("প্লানিং এন্ড ডেভেলপমেন্ট", _COMMON_ROLES),
+    "বিতর্ক": ("বিতর্ক", _COMMON_ROLES),
+    "সংস্কৃতি": ("সাংস্কৃতিক", _COMMON_ROLES)
 }
 # -----------------------------------------------------------------------------
 
@@ -95,8 +133,8 @@ def get_member(tg_id: int) -> tuple[str, str] | None:
 
 
 def build_tag(dept: str, role: str) -> str:
-    if dept != "Central":
-        return f"{role}, {dept}"
+    if dept != "কেন্দ্র":
+        return f"{role},{dept}"
     return f"{role}"
 
 def validate_tag(tag: str) -> str | None:
