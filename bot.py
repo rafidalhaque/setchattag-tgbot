@@ -395,15 +395,21 @@ async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    stored = get_member(update.effective_user.id)
+    user = update.effective_user
+    if not await is_group_member(context.bot, TARGET_GROUP_ID, user.id):
+        await update.effective_message.reply_text(
+            "আপনি গ্রুপের সদস্য নন। গ্রুপ এডমিনের সাথে যোগাযোগ করুন।"
+        )
+        return
+    stored = get_member(user.id)
     if stored:
         await update.effective_message.reply_text(
-            f"আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ! আপনার বর্তমান ট্যাগ: {build_tag(*stored)}। "
+            f"আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ! আপনার বর্তমান ট্যাগ: {build_tag(*stored)}। "
             "পরিবর্তন করতে /setrole দিন।"
         )
     else:
         await update.effective_message.reply_text(
-            "আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ! আপনার দায়িত্ব ও বিভাগ সেট করতে /setrole কমান্ড দিন।"
+            "আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ! আপনার দায়িত্ব ও বিভাগ সেট করতে /setrole কমান্ড দিন।"
         )
 
 
