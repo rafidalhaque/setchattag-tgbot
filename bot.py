@@ -1,4 +1,4 @@
-"""Telegram bot: department/role selection -> chat member tag (Bot API 10.1).
+"""Telegram bot: department/role selection -> chat member tag (Bot API 10.2).
 
 Setup:
   1. pip install -e .
@@ -7,6 +7,13 @@ Setup:
      via promoteChatMember(can_manage_tags=True) from another admin account
      first. The bot cannot grant this right to itself.
   4. Run: python bot.py
+
+Ephemeral messages (Bot API 10.2): as of PTB 22.8 (installed here), none of
+this surface is wrapped yet -- BotCommand has no is_ephemeral field, Bot
+methods take no receiver_user_id, there's no edit_ephemeral_message_*/
+delete_ephemeral_message, and Message doesn't model ephemeral_message_id.
+Everything ephemeral below goes through raw_api() (Bot._post) as a stub;
+swap to the real wrapped methods once PTB ships them.
 """
 from __future__ import annotations
 
@@ -25,6 +32,8 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     ConversationHandler,
+    MessageHandler,
+    filters,
 )
 
 load_dotenv()
@@ -37,13 +46,15 @@ DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).with_name("members.d
 # --- department/role config: edit this to change the menu ------------------
 # dept_code -> (display name, {role_code: role display name})
 DEPARTMENTS: dict[str, tuple[str, dict[str, str]]] = {
-    "কেন্দ্র": ("কেন্দ্র", {"CP": "কেন্দ্রীয় সভাপতি", "SG": "সেক্রেটারি জেনারেল"}),
-    "তথ্যপ্রযুক্তি": ("তথ্যপ্রযুক্তি", {"Sec": "Secretary", "Member": "Agent"}),
+    "Central": ("কেন্দ্র", {"CP": "কেন্দ্রীয় সভাপতি", "SG": "সেক্রেটারি জেনারেল"}),
+    "IT": ("তথ্যপ্রযুক্তি", {"Sec": "সম্পাদক", "Member": "সদস্য"}),
 }
 # -----------------------------------------------------------------------------
 
 SELECT_DEPARTMENT, SELECT_ROLE = range(2)
 MAX_TAG_LEN = 16
+CONVERSATION_TIMEOUT = 120  # seconds idle before the picker is torn down
+EPHEMERAL_COMMANDS = {"setrole": True, "cancel": True, "mytag": False}
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -114,11 +125,107 @@ def role_keyboard(dept: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.effective_message.reply_text(
-        "আপনার বিভাগ:", reply_markup=department_keyboard()
-    )
+# --- raw Bot API 10.2 ephemeral-message stubs (not wrapped by PTB 22.8) ----
+
+async def raw_api(bot, method: str, params: dict):
+    """Call a Bot API method PTB hasn't wrapped yet. Bot._post serializes
+    TelegramObject values (e.g. reply_markup=InlineKeyboardMarkup(...)) the
+    same way every wrapped method does internally, and returns the decoded
+    `result` JSON as-is (dict/list/bool) -- no Message/BotCommand typing.
+    """
+    return await bot._post(method, params)
+
+
+async def register_commands(app: Application) -> None:
+    # BotCommand has no is_ephemeral field in installed PTB -> raw payload.
+    commands = [
+        {"command": cmd, "description": desc, "is_ephemeral": EPHEMERAL_COMMANDS.get(cmd, False)}
+        for cmd, desc in [
+            ("setrole", "Pick your department & role"),
+            ("mytag", "Show your current tag"),
+            ("cancel", "Cancel the selection"),
+        ]
+    ]
+    await raw_api(app.bot, "setMyCommands", {"commands": commands})
+
+
+def _is_group(chat) -> bool:
+    return chat.type in ("group", "supergroup")
+
+
+async def cleanup_ephemeral(context: ContextTypes.DEFAULT_TYPE) -> None:
+    eid = context.user_data.pop("ephemeral_message_id", None)
+    chat_id = context.user_data.pop("ephemeral_chat_id", None)
+    if not eid:
+        return
+    try:
+        await raw_api(context.bot, "deleteEphemeralMessage", {"chat_id": chat_id, "ephemeral_message_id": eid})
+    except (BadRequest, Forbidden) as e:
+        logger.warning("couldn't delete stray ephemeral picker %s: %s", eid, e)
+
+
+async def send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, markup: InlineKeyboardMarkup) -> int:
+    """Send the department picker. Ephemeral (receiver_user_id) inside the
+    group so only the tapper sees it; a normal DM reply in private chats.
+    Must stay fast and blocking-call-free -- Telegram only accepts the
+    ephemeral reply within 15s of the triggering command.
+    """
+    chat, user = update.effective_chat, update.effective_user
+    if not _is_group(chat):
+        await update.effective_message.reply_text(text, reply_markup=markup)
+        return SELECT_DEPARTMENT
+
+    try:
+        result = await raw_api(
+            context.bot,
+            "sendMessage",
+            {"chat_id": chat.id, "receiver_user_id": user.id, "text": text, "reply_markup": markup},
+        )
+    except (BadRequest, Forbidden) as e:
+        logger.warning("ephemeral picker failed to deliver to %s: %s", user.id, e)  # e.g. user offline
+        return ConversationHandler.END
+
+    eid = result.get("ephemeral_message_id") if isinstance(result, dict) else 0
+    if not eid:
+        logger.warning("sendMessage returned no ephemeral_message_id for user %s: %r", user.id, result)
+        return ConversationHandler.END
+    context.user_data["ephemeral_message_id"] = eid
+    context.user_data["ephemeral_chat_id"] = chat.id
     return SELECT_DEPARTMENT
+
+
+async def edit_picker(query, context: ContextTypes.DEFAULT_TYPE, text: str, markup: InlineKeyboardMarkup | None) -> None:
+    """Edit the in-flight picker/confirmation, ephemeral or plain to match how it was sent."""
+    eid = context.user_data.get("ephemeral_message_id")
+    if not eid:
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+
+    chat_id = context.user_data["ephemeral_chat_id"]
+    if markup is not None:
+        await raw_api(
+            context.bot,
+            "editEphemeralMessageText",
+            {"chat_id": chat_id, "ephemeral_message_id": eid, "text": text, "reply_markup": markup},
+        )
+    else:
+        # text-only change with no keyboard update -- editEphemeralMessageReplyMarkup
+        # is for markup-only edits; kept here per spec even though this file
+        # always changes text too, so this branch currently never fires.
+        await raw_api(
+            context.bot,
+            "editEphemeralMessageReplyMarkup",
+            {"chat_id": chat_id, "ephemeral_message_id": eid, "reply_markup": markup},
+        )
+
+
+async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # The incoming /setrole command can itself be an ephemeral command;
+    # PTB doesn't model that field, so read it from the raw update payload.
+    incoming_eid = update.message.api_kwargs.get("ephemeral_message_id", 0) if update.message else 0
+    if incoming_eid:
+        logger.info("setrole invoked as ephemeral command (id=%s)", incoming_eid)
+    return await send_picker(update, context, "Pick your department:", department_keyboard())
 
 
 async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -140,16 +247,14 @@ async def on_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     query = update.callback_query
     await query.answer()
     dept = query.data.split(":", 1)[1]
-    await query.edit_message_text(
-        f"{DEPARTMENTS[dept][0]} — pick your role:", reply_markup=role_keyboard(dept)
-    )
+    await edit_picker(query, context, f"{DEPARTMENTS[dept][0]} — pick your role:", role_keyboard(dept))
     return SELECT_ROLE
 
 
 async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> None:
     err = validate_tag(tag)
     if err:
-        await query.edit_message_text(f"Can't set tag: {err}")
+        await edit_picker(query, context, f"Can't set tag: {err}", None)
         return
 
     user = query.from_user
@@ -163,19 +268,19 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
                 {"chat_id": GROUP_CHAT_ID, "user_id": user.id, "tag": tag},
             )
     except Forbidden:
-        await query.edit_message_text(
-            "I can't set tags here — ask a group admin to grant me can_manage_tags."
+        await edit_picker(
+            query, context, "I can't set tags here — ask a group admin to grant me can_manage_tags.", None
         )
         return
     except BadRequest as e:
-        await query.edit_message_text(f"Telegram rejected the tag: {e}")
+        await edit_picker(query, context, f"Telegram rejected the tag: {e}", None)
         return
 
     if tag:
         save_member(user, dept, role_label)
-        await query.edit_message_text(f"Done! Your tag is now: {tag}")
+        await edit_picker(query, context, f"Done! Your tag is now: {tag}", None)
     else:
-        await query.edit_message_text("Tag removed.")
+        await edit_picker(query, context, "Tag removed.", None)
 
 
 async def on_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -183,6 +288,8 @@ async def on_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer()
     _prefix, dept, role = query.data.split(":", 2)
     await apply_tag(query, context, dept, build_tag(dept, role), role)
+    context.user_data.pop("ephemeral_message_id", None)
+    context.user_data.pop("ephemeral_chat_id", None)
     return ConversationHandler.END
 
 
@@ -191,11 +298,19 @@ async def on_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer()
     dept = query.data.split(":", 1)[1]
     await apply_tag(query, context, dept, "", "")
+    context.user_data.pop("ephemeral_message_id", None)
+    context.user_data.pop("ephemeral_chat_id", None)
     return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await cleanup_ephemeral(context)
     await update.effective_message.reply_text("Cancelled.")
+    return ConversationHandler.END
+
+
+async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await cleanup_ephemeral(context)
     return ConversationHandler.END
 
 
@@ -215,7 +330,7 @@ async def mytag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(register_commands).build()
 
     conv = ConversationHandler(
         entry_points=[
@@ -228,9 +343,11 @@ def main() -> None:
                 CallbackQueryHandler(on_role, pattern=r"^r:"),
                 CallbackQueryHandler(on_remove, pattern=r"^x:"),
             ],
+            ConversationHandler.TIMEOUT: [CallbackQueryHandler(on_timeout), MessageHandler(filters.ALL, on_timeout)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_chat=False,  # join event fires in the group chat, replies happen in DM -- track by user only
+        conversation_timeout=CONVERSATION_TIMEOUT,
     )
     app.add_handler(conv)
     app.add_handler(CommandHandler("mytag", mytag))
