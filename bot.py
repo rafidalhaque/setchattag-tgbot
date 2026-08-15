@@ -418,13 +418,13 @@ async def mytag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         member = await context.bot.get_chat_member(TARGET_GROUP_ID, user.id)
     except (BadRequest, Forbidden) as e:
-        await update.effective_message.reply_text(f"Couldn't look you up: {e}")
+        await update.effective_message.reply_text(f"Error! Couldn't look you up: {e}")
         return
     tag = getattr(member, "tag", None)
     if not tag:
         stored = get_member(user.id)
         tag = build_tag(*stored) if stored else None
-    await update.effective_message.reply_text(f"Your tag: {tag}" if tag else "You have no tag set.")
+    await update.effective_message.reply_text(f"আপনার ট্যাগ: {tag}" if tag else "আপনার ট্যাগ এখনো যুক্ত করা হয়নি। /setrole কমান্ড ব্যবহার করুন।")
 
 
 def main() -> None:
