@@ -95,8 +95,9 @@ def get_member(tg_id: int) -> tuple[str, str] | None:
 
 
 def build_tag(dept: str, role: str) -> str:
-    return f"{dept}, {role}"
-
+    if dept != "Central":
+        return f"{role}, {dept}"
+    return f"{role}"
 
 def validate_tag(tag: str) -> str | None:
     """Return an error message if tag is invalid, else None."""
