@@ -180,6 +180,7 @@ async def register_commands(app: Application) -> None:
     commands = [
         {"command": cmd, "description": desc, "is_ephemeral": EPHEMERAL_COMMANDS.get(cmd, False)}
         for cmd, desc in [
+            ("start", "শুরু করুন"),
             ("setrole", "আপনার দায়িত্ব ও বিভাগ সিলেক্ট করুন"),
             ("mytag", "বর্তমান ট্যাগ দেখুন"),
             ("cancel", "বর্তমান অবস্থা বাতিল করুন"),
@@ -393,6 +394,19 @@ async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    stored = get_member(update.effective_user.id)
+    if stored:
+        await update.effective_message.reply_text(
+            f"আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ! আপনার বর্তমান ট্যাগ: {build_tag(*stored)}। "
+            "পরিবর্তন করতে /setrole দিন।"
+        )
+    else:
+        await update.effective_message.reply_text(
+            "আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ! আপনার দায়িত্ব ও বিভাগ সেট করতে /setrole কমান্ড দিন।"
+        )
+
+
 async def mytag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     try:
@@ -429,6 +443,7 @@ def main() -> None:
         conversation_timeout=CONVERSATION_TIMEOUT,
     )
     app.add_handler(conv)
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("mytag", mytag))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
