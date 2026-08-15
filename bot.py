@@ -47,7 +47,7 @@ DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).with_name("members.d
 # dept_code -> (display name, {role_code: role display name})
 DEPARTMENTS: dict[str, tuple[str, dict[str, str]]] = {
     "Central": ("কেন্দ্র", {"CP": "কেন্দ্রীয় সভাপতি", "SG": "সেক্রেটারি জেনারেল"}),
-    "IT": ("তথ্যপ্রযুক্তি", {"Sec": "সম্পাদক", "Member": "সদস্য"}),
+    "IT": ("তথ্যপ্রযুক্তি", {"সম্পাদক": "সম্পাদক", "সহকারী":"সহকারী সম্পাদক", "সদস্য": "সদস্য"}),
 }
 # -----------------------------------------------------------------------------
 
@@ -103,8 +103,8 @@ def validate_tag(tag: str) -> str | None:
     """Return an error message if tag is invalid, else None."""
     if len(tag) > MAX_TAG_LEN:
         return f"Tag '{tag}' is {len(tag)} chars, max {MAX_TAG_LEN}."
-    if not tag.isascii():
-        return f"Tag '{tag}' has non-ASCII/emoji characters."
+    # if not tag.isascii():
+    #     return f"Tag '{tag}' has non-ASCII/emoji characters."
     return None
 
 
@@ -231,6 +231,10 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     incoming_eid = update.message.api_kwargs.get("ephemeral_message_id", 0) if update.message else 0
     if incoming_eid:
         logger.info("setrole invoked as ephemeral command (id=%s)", incoming_eid)
+    # also wired as a fallback so re-running /setrole restarts a stuck conversation
+    # (e.g. user deleted the picker message client-side -- no update for that, so the
+    # conversation stays parked in its old state until this or the timeout clears it)
+    await cleanup_ephemeral(context)
     return await send_picker(update, context, "Pick your department:", department_keyboard())
 
 
@@ -375,7 +379,7 @@ def main() -> None:
             ],
             ConversationHandler.TIMEOUT: [CallbackQueryHandler(on_timeout), MessageHandler(filters.ALL, on_timeout)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("setrole", setrole)],
         per_chat=False,  # join event fires in the group chat, replies happen in DM -- track by user only
         conversation_timeout=CONVERSATION_TIMEOUT,
     )

@@ -3,6 +3,6 @@ name = "cit-group-management"
 version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
-    "python-telegram-bot>=22.7",
+    "python-telegram-bot[job-queue]>=22.7",
     "python-dotenv>=1.0",
 ]
