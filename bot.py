@@ -63,7 +63,7 @@ DEPARTMENTS: dict[str, tuple[str, dict[str, str]]] = {
     "অর্থ": ("অর্থ", _COMMON_ROLES),
     "কলেজ": ("কলেজ", _COMMON_ROLES),
     "শিক্ষা": ("শিক্ষা", _COMMON_ROLES),
-    "ব্যবসা": ("ব্যবসা", _COMMON_ROLES),
+    "ব্যবসায় শিক্ষা": ("ব্যবসা শিক্ষা", _COMMON_ROLES),
     "উচ্চশিক্ষা": ("উচ্চশিক্ষা", _COMMON_ROLES),
     "গবেষণা": ("গবেষণা", _COMMON_ROLES),
     "আইটি": ("তথ্যপ্রযুক্তি", _COMMON_ROLES),
@@ -133,9 +133,9 @@ def get_member(tg_id: int) -> tuple[str, str] | None:
 
 
 def build_tag(dept: str, role: str) -> str:
-    if dept != "কেন্দ্র":
-        return f"{role},{dept}"
-    return f"{role}"
+    # if dept != "কেন্দ্র":
+    #     return f"{role},{dept}"
+    return f"{dept}" # tag = dept name only to avoid character limit exceed
 
 def validate_tag(tag: str) -> str | None:
     """Return an error message if tag is invalid, else None."""
@@ -160,7 +160,7 @@ def role_keyboard(dept: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(rname, callback_data=f"r:{dept}:{rcode}")]
         for rcode, rname in roles.items()
     ]
-    rows.append([InlineKeyboardButton("Remove my tag", callback_data=f"x:{dept}")])
+    rows.append([InlineKeyboardButton("বর্তমান ট্যাগ মুছুন", callback_data=f"x:{dept}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -180,9 +180,9 @@ async def register_commands(app: Application) -> None:
     commands = [
         {"command": cmd, "description": desc, "is_ephemeral": EPHEMERAL_COMMANDS.get(cmd, False)}
         for cmd, desc in [
-            ("setrole", "Pick your department & role"),
-            ("mytag", "Show your current tag"),
-            ("cancel", "Cancel the selection"),
+            ("setrole", "আপনার দায়িত্ব ও বিভাগ সিলেক্ট করুন"),
+            ("mytag", "বর্তমান ট্যাগ দেখুন"),
+            ("cancel", "বর্তমান অবস্থা বাতিল করুন"),
         ]
     ]
     await raw_api(app.bot, "setMyCommands", {"commands": commands})
@@ -273,7 +273,7 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # (e.g. user deleted the picker message client-side -- no update for that, so the
     # conversation stays parked in its old state until this or the timeout clears it)
     await cleanup_ephemeral(context)
-    return await send_picker(update, context, "Pick your department:", department_keyboard())
+    return await send_picker(update, context, "আপনার বিভাগ কোনটি?", department_keyboard())
 
 
 async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -284,7 +284,7 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     try:
         await context.bot.send_message(
-            new.user.id, "Welcome! Pick your department:", reply_markup=department_keyboard()
+            new.user.id, "আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ। আপনার বিভাগ কোনটি?", reply_markup=department_keyboard()
         )
     except Forbidden:
         return ConversationHandler.END  # ponytail: user never DM'd the bot, they can run /setrole later
@@ -314,7 +314,7 @@ async def is_group_member(bot, target_group_id: int, user_id: int) -> bool:
 async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> None:
     err = validate_tag(tag)
     if err:
-        await edit_picker(query, context, f"Can't set tag: {err}", None)
+        await edit_picker(query, context, f"ট্যাগ যুক্ত করা যাচ্ছে না। সমস্যা: {err}", None)
         return
 
     user = query.from_user
@@ -322,8 +322,8 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         await edit_picker(
             query,
             context,
-            "You're not a member of the internal group, so a tag can't be set. "
-            "Contact an admin if you think this is wrong.",
+            "আপনি গ্রুপের সদস্য নন।"
+            "গ্রুপ এডমিনের সাথে যোগাযোগ করুন। ",
             None,
         )
         return
@@ -339,26 +339,25 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
             )
     except Forbidden:
         await edit_picker(
-            query, context, "I can't set tags here — ask a group admin to grant me can_manage_tags.", None
+            query, context, "আমি ট্যাগ যুক্ত করতে পারছি না। এডমিনকে বলুন আমাকে can_manage_tags পার্মিশন দিতে।.", None
         )
         return
     except BadRequest as e:
         if "chat_creator_required" in str(e).lower():
             await edit_picker(
                 query, context,
-                "Can't set a tag for the group owner through the bot — only the owner's own "
-                "account can do that. This is a Telegram restriction, not a bug.",
+                "টেলিগ্রামের রেস্ট্রিকশনের কারণে গ্রুপ owner এর ট্যাগ যুক্ত করতে পারছি না। গ্রুপ owner ম্যানুয়ালি নিজের ট্যাগ যুক্ত করতে পারবেন।",
                 None,
             )
         else:
-            await edit_picker(query, context, f"Telegram rejected the tag: {e}", None)
+            await edit_picker(query, context, f"টেলিগ্রাম এই ট্যাগটি রিজেক্ট করেছে: {e}", None)
         return
 
     if tag:
         save_member(user, dept, role_label)
-        await edit_picker(query, context, f"Done! Your tag is now: {tag}", None)
+        await edit_picker(query, context, f"জাজাকাল্লাহু খাইর। আপনার বর্তমান ট্যাগ: {tag}", None)
     else:
-        await edit_picker(query, context, "Tag removed.", None)
+        await edit_picker(query, context, "ট্যাগ রিমোভ করা হয়েছে।", None)
 
 
 async def on_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
