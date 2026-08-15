@@ -156,10 +156,15 @@ def _is_group(chat) -> bool:
 async def cleanup_ephemeral(context: ContextTypes.DEFAULT_TYPE) -> None:
     eid = context.user_data.pop("ephemeral_message_id", None)
     chat_id = context.user_data.pop("ephemeral_chat_id", None)
+    receiver_user_id = context.user_data.pop("ephemeral_user_id", None)
     if not eid:
         return
     try:
-        await raw_api(context.bot, "deleteEphemeralMessage", {"chat_id": chat_id, "ephemeral_message_id": eid})
+        await raw_api(
+            context.bot,
+            "deleteEphemeralMessage",
+            {"chat_id": chat_id, "receiver_user_id": receiver_user_id, "ephemeral_message_id": eid},
+        )
     except (BadRequest, Forbidden) as e:
         logger.warning("couldn't delete stray ephemeral picker %s: %s", eid, e)
 
@@ -191,6 +196,7 @@ async def send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
         return ConversationHandler.END
     context.user_data["ephemeral_message_id"] = eid
     context.user_data["ephemeral_chat_id"] = chat.id
+    context.user_data["ephemeral_user_id"] = user.id
     return SELECT_DEPARTMENT
 
 
@@ -202,21 +208,20 @@ async def edit_picker(query, context: ContextTypes.DEFAULT_TYPE, text: str, mark
         return
 
     chat_id = context.user_data["ephemeral_chat_id"]
-    if markup is not None:
-        await raw_api(
-            context.bot,
-            "editEphemeralMessageText",
-            {"chat_id": chat_id, "ephemeral_message_id": eid, "text": text, "reply_markup": markup},
-        )
-    else:
-        # text-only change with no keyboard update -- editEphemeralMessageReplyMarkup
-        # is for markup-only edits; kept here per spec even though this file
-        # always changes text too, so this branch currently never fires.
-        await raw_api(
-            context.bot,
-            "editEphemeralMessageReplyMarkup",
-            {"chat_id": chat_id, "ephemeral_message_id": eid, "reply_markup": markup},
-        )
+    receiver_user_id = context.user_data["ephemeral_user_id"]
+    # text always changes here; markup=None means "clear the keyboard", not "skip the text",
+    # so this always needs editEphemeralMessageText (pass an empty markup to drop the buttons).
+    await raw_api(
+        context.bot,
+        "editEphemeralMessageText",
+        {
+            "chat_id": chat_id,
+            "receiver_user_id": receiver_user_id,
+            "ephemeral_message_id": eid,
+            "text": text,
+            "reply_markup": markup or InlineKeyboardMarkup([]),
+        },
+    )
 
 
 async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -290,6 +295,7 @@ async def on_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await apply_tag(query, context, dept, build_tag(dept, role), role)
     context.user_data.pop("ephemeral_message_id", None)
     context.user_data.pop("ephemeral_chat_id", None)
+    context.user_data.pop("ephemeral_user_id", None)
     return ConversationHandler.END
 
 
@@ -300,6 +306,7 @@ async def on_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await apply_tag(query, context, dept, "", "")
     context.user_data.pop("ephemeral_message_id", None)
     context.user_data.pop("ephemeral_chat_id", None)
+    context.user_data.pop("ephemeral_user_id", None)
     return ConversationHandler.END
 
 
