@@ -305,7 +305,15 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         )
         return
     except BadRequest as e:
-        await edit_picker(query, context, f"Telegram rejected the tag: {e}", None)
+        if "chat_creator_required" in str(e).lower():
+            await edit_picker(
+                query, context,
+                "Can't set a tag for the group owner through the bot — only the owner's own "
+                "account can do that. This is a Telegram restriction, not a bug.",
+                None,
+            )
+        else:
+            await edit_picker(query, context, f"Telegram rejected the tag: {e}", None)
         return
 
     if tag:
