@@ -88,6 +88,10 @@ DEPARTMENTS: dict[str, tuple[str, dict[str, str]]] = {
 }
 # -----------------------------------------------------------------------------
 
+# callback_data is capped at 64 bytes by Telegram; Bengali dept/role codes blow past
+# that when combined (e.g. "r:{dept}:{role}"), so buttons carry index positions instead.
+DEPT_CODES = list(DEPARTMENTS.keys())
+
 SELECT_DEPARTMENT, SELECT_ROLE = range(2)
 MAX_TAG_LEN = 16
 CONVERSATION_TIMEOUT = 120  # seconds idle before the picker is torn down
@@ -147,19 +151,20 @@ def validate_tag(tag: str) -> str | None:
 
 def department_keyboard() -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(name, callback_data=f"d:{code}")]
-        for code, (name, _roles) in DEPARTMENTS.items()
+        [InlineKeyboardButton(name, callback_data=f"d:{i}")]
+        for i, (name, _roles) in enumerate(DEPARTMENTS.values())
     ]
     return InlineKeyboardMarkup(rows)
 
 
 def role_keyboard(dept: str) -> InlineKeyboardMarkup:
+    dept_idx = DEPT_CODES.index(dept)
     _name, roles = DEPARTMENTS[dept]
     rows = [
-        [InlineKeyboardButton(rname, callback_data=f"r:{dept}:{rcode}")]
-        for rcode, rname in roles.items()
+        [InlineKeyboardButton(rname, callback_data=f"r:{dept_idx}:{ridx}")]
+        for ridx, rname in enumerate(roles.values())
     ]
-    rows.append([InlineKeyboardButton("বর্তমান ট্যাগ মুছুন", callback_data=f"x:{dept}")])
+    rows.append([InlineKeyboardButton("বর্তমান ট্যাগ মুছুন", callback_data=f"x:{dept_idx}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -268,7 +273,10 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # PTB doesn't model that field, so read it from the raw update payload.
     incoming_eid = update.message.api_kwargs.get("ephemeral_message_id", 0) if update.message else 0
     if incoming_eid:
-        logger.info("setrole invoked as ephemeral command (id=%s)", incoming_eid)
+        logger.info(
+            "setrole invoked as ephemeral command (id=%s) update_id=%s raw=%s",
+            incoming_eid, update.update_id, update.to_dict(),
+        )
     # also wired as a fallback so re-running /setrole restarts a stuck conversation
     # (e.g. user deleted the picker message client-side -- no update for that, so the
     # conversation stays parked in its old state until this or the timeout clears it)
@@ -294,7 +302,7 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    dept = query.data.split(":", 1)[1]
+    dept = DEPT_CODES[int(query.data.split(":", 1)[1])]
     await edit_picker(query, context, f"{DEPARTMENTS[dept][0]} — pick your role:", role_keyboard(dept))
     return SELECT_ROLE
 
@@ -363,7 +371,9 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
 async def on_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    _prefix, dept, role = query.data.split(":", 2)
+    _prefix, dept_idx, role_idx = query.data.split(":", 2)
+    dept = DEPT_CODES[int(dept_idx)]
+    role = list(DEPARTMENTS[dept][1].keys())[int(role_idx)]
     await apply_tag(query, context, dept, build_tag(dept, role), role)
     context.user_data.pop("ephemeral_message_id", None)
     context.user_data.pop("ephemeral_chat_id", None)
@@ -374,7 +384,7 @@ async def on_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    dept = query.data.split(":", 1)[1]
+    dept = DEPT_CODES[int(query.data.split(":", 1)[1])]
     await apply_tag(query, context, dept, "", "")
     context.user_data.pop("ephemeral_message_id", None)
     context.user_data.pop("ephemeral_chat_id", None)
