@@ -274,8 +274,9 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     incoming_eid = update.message.api_kwargs.get("ephemeral_message_id", 0) if update.message else 0
     if incoming_eid:
         logger.info(
-            "setrole invoked as ephemeral command (id=%s) update_id=%s raw=%s",
-            incoming_eid, update.update_id, update.to_dict(),
+            "setrole invoked as ephemeral command (id=%s) update_id=%s user_id=%s",
+            incoming_eid, update.update_id,
+            update.effective_user.id if update.effective_user else None,
         )
     # also wired as a fallback so re-running /setrole restarts a stuck conversation
     # (e.g. user deleted the picker message client-side -- no update for that, so the
