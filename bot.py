@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -95,6 +96,12 @@ DEPT_CODES = list(DEPARTMENTS.keys())
 SELECT_DEPARTMENT, SELECT_ROLE = range(2)
 MAX_TAG_LEN = 16
 CONVERSATION_TIMEOUT = 120  # seconds idle before the picker is torn down
+
+# setChatMemberTag itself emits a chat_member update shaped like a real join
+# (left/kicked -> member), which on_join would otherwise mistake for one.
+# Track users we just tagged ourselves and skip the resulting event.
+RECENTLY_TAGGED: dict[int, float] = {}
+RECENT_TAG_WINDOW = 10  # seconds
 EPHEMERAL_COMMANDS = {"setrole": True, "cancel": True, "mytag": False}
 
 logging.basicConfig(level=logging.INFO)
@@ -289,9 +296,10 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_chat.id != TARGET_GROUP_ID:
         return ConversationHandler.END
     old, new = update.chat_member.old_chat_member, update.chat_member.new_chat_member
-    # setChatMemberTag also fires chat_member updates (tag is a ChatMember field);
-    # only a real left/kicked -> member transition is an actual join.
-    if new.status not in ("member", "administrator") or old.status not in ("left", "kicked"):
+    if new.status not in ("member", "administrator") or old.status == new.status:
+        return ConversationHandler.END
+    tagged_at = RECENTLY_TAGGED.get(new.user.id)
+    if tagged_at is not None and time.monotonic() - tagged_at < RECENT_TAG_WINDOW:
         return ConversationHandler.END
     try:
         await context.bot.send_message(
@@ -339,6 +347,7 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         )
         return
 
+    RECENTLY_TAGGED[user.id] = time.monotonic()
     try:
         if hasattr(context.bot, "set_chat_member_tag"):
             await context.bot.set_chat_member_tag(TARGET_GROUP_ID, user.id, tag)
