@@ -289,7 +289,9 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_chat.id != TARGET_GROUP_ID:
         return ConversationHandler.END
     old, new = update.chat_member.old_chat_member, update.chat_member.new_chat_member
-    if new.status not in ("member", "administrator") or old.status == new.status:
+    # setChatMemberTag also fires chat_member updates (tag is a ChatMember field);
+    # only a real left/kicked -> member transition is an actual join.
+    if new.status not in ("member", "administrator") or old.status not in ("left", "kicked"):
         return ConversationHandler.END
     try:
         await context.bot.send_message(
