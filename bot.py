@@ -342,7 +342,17 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         return
 
     user = query.from_user
-    if not await is_group_member(context.bot, TARGET_GROUP_ID, user.id):
+    try:
+        member = await context.bot.get_chat_member(TARGET_GROUP_ID, user.id)
+    except (BadRequest, Forbidden):
+        member = None
+    is_member = member is not None and (
+        member.status in ("creator", "administrator", "member")
+        or (member.status == "restricted" and member.is_member)
+    )
+    is_admin = member is not None and member.status in ("creator", "administrator")
+
+    if not is_member:
         await edit_picker(
             query,
             context,
@@ -369,6 +379,17 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         return
     except BadRequest as e:
         if "chat_creator_required" in str(e).lower():
+            try:
+                await context.bot.set_chat_administrator_custom_title(TARGET_GROUP_ID, user.id, tag)
+            except (BadRequest, Forbidden) as title_err:
+                logger.info("admin custom title fallback failed for %s: %s", user.id, title_err)
+            else:
+                if tag:
+                    save_member(user, dept, role_label)
+                    await edit_picker(query, context, f"জাজাকাল্লাহু খাইর। আপনার বর্তমান টাইটেল: {tag}", None)
+                else:
+                    await edit_picker(query, context, "টাইটেল রিমোভ করা হয়েছে।", None)
+                return
             await edit_picker(
                 query, context,
                 "টেলিগ্রামের রেস্ট্রিকশনের কারণে গ্রুপ owner এর ট্যাগ যুক্ত করতে পারছি না। গ্রুপ owner ম্যানুয়ালি নিজের ট্যাগ যুক্ত করতে পারবেন।",
@@ -377,6 +398,13 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         else:
             await edit_picker(query, context, f"টেলিগ্রাম এই ট্যাগটি রিজেক্ট করেছে: {e}", None)
         return
+
+    if is_admin:
+        try:
+            await context.bot.set_chat_administrator_custom_title(TARGET_GROUP_ID, user.id, tag)
+        except (BadRequest, Forbidden) as e:
+            # ponytail: expected for admins/owner not promoted by this bot, Telegram rejects it outright
+            logger.info("admin custom title sync skipped for %s: %s", user.id, e)
 
     if tag:
         save_member(user, dept, role_label)
