@@ -107,7 +107,7 @@ CONVERSATION_TIMEOUT = 120  # seconds idle before the picker is torn down
 # Track users we just tagged ourselves and skip the resulting event.
 RECENTLY_TAGGED: dict[int, float] = {}
 RECENT_TAG_WINDOW = 10  # seconds
-EPHEMERAL_COMMANDS = {"setrole": True, "cancel": True, "mytag": False}
+EPHEMERAL_COMMANDS = {"setrole": True, "cancel": True, "mytag": True, "start": True}
 RATE_LIMIT_MSG = "টেলিগ্রাম এই মুহূর্তে ব্যস্ত। কিছুক্ষণ পর /setrole আবার চেষ্টা করুন।"
 
 logging.basicConfig(level=logging.INFO)
