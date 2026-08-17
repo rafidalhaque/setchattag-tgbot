@@ -17,17 +17,22 @@ swap to the real wrapped methods once PTB ships them.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
 import time
 from pathlib import Path
+from typing import Awaitable
 
+from aiolimiter import AsyncLimiter
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
+    AIORateLimiter,
     Application,
+    BaseUpdateProcessor,
     CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
@@ -103,43 +108,62 @@ CONVERSATION_TIMEOUT = 120  # seconds idle before the picker is torn down
 RECENTLY_TAGGED: dict[int, float] = {}
 RECENT_TAG_WINDOW = 10  # seconds
 EPHEMERAL_COMMANDS = {"setrole": True, "cancel": True, "mytag": False}
+RATE_LIMIT_MSG = "টেলিগ্রাম এই মুহূর্তে ব্যস্ত। কিছুক্ষণ পর /setrole আবার চেষ্টা করুন।"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+# Single reused connection instead of one-per-call (the old `with sqlite3.connect(...) as con`
+# only manages the transaction, not the connection -- it never closed). check_same_thread=False
+# because asyncio.to_thread runs each call on a threadpool thread, not the connection's creation
+# thread; _DB_LOCK below is what actually keeps access to it serialized, so that's safe.
+_DB_LOCK = asyncio.Lock()
+_con = sqlite3.connect(DB_PATH, check_same_thread=False)
+_con.execute("PRAGMA journal_mode=WAL")
+
+
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            """CREATE TABLE IF NOT EXISTS members (
-                tg_id INTEGER PRIMARY KEY,
-                first_name TEXT,
-                last_name TEXT,
-                username TEXT,
-                department TEXT NOT NULL,
-                role TEXT NOT NULL
-            )"""
-        )
+    _con.execute(
+        """CREATE TABLE IF NOT EXISTS members (
+            tg_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            last_name TEXT,
+            username TEXT,
+            department TEXT NOT NULL,
+            role TEXT NOT NULL
+        )"""
+    )
+    _con.commit()
 
 
-def save_member(user, dept: str, role: str) -> None:
-    with sqlite3.connect(DB_PATH) as con:
-        con.execute(
-            """INSERT INTO members (tg_id, first_name, last_name, username, department, role)
-               VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(tg_id) DO UPDATE SET
-                 first_name=excluded.first_name, last_name=excluded.last_name,
-                 username=excluded.username, department=excluded.department, role=excluded.role""",
-            (user.id, user.first_name, user.last_name, user.username, dept, role),
-        )
+def _save_member_sync(user, dept: str, role: str) -> None:
+    _con.execute(
+        """INSERT INTO members (tg_id, first_name, last_name, username, department, role)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(tg_id) DO UPDATE SET
+             first_name=excluded.first_name, last_name=excluded.last_name,
+             username=excluded.username, department=excluded.department, role=excluded.role""",
+        (user.id, user.first_name, user.last_name, user.username, dept, role),
+    )
+    _con.commit()
 
 
-def get_member(tg_id: int) -> tuple[str, str] | None:
-    with sqlite3.connect(DB_PATH) as con:
-        row = con.execute(
-            "SELECT department, role FROM members WHERE tg_id = ?", (tg_id,)
-        ).fetchone()
+async def save_member(user, dept: str, role: str) -> None:
+    async with _DB_LOCK:
+        await asyncio.to_thread(_save_member_sync, user, dept, role)
+
+
+def _get_member_sync(tg_id: int) -> tuple[str, str] | None:
+    row = _con.execute(
+        "SELECT department, role FROM members WHERE tg_id = ?", (tg_id,)
+    ).fetchone()
     return tuple(row) if row else None
+
+
+async def get_member(tg_id: int) -> tuple[str, str] | None:
+    async with _DB_LOCK:
+        return await asyncio.to_thread(_get_member_sync, tg_id)
 
 
 def build_tag(dept: str, role: str) -> str:
@@ -177,13 +201,34 @@ def role_keyboard(dept: str) -> InlineKeyboardMarkup:
 
 # --- raw Bot API 10.2 ephemeral-message stubs (not wrapped by PTB 22.8) ----
 
+# AIORateLimiter (attached in main()) only wraps ExtBot's individually-implemented
+# methods (send_message, get_chat_member, ...) via Bot._do_post -- it does not see
+# bot._post() called directly, which is exactly what raw_api() does for every
+# ephemeral call. That's the highest-volume path in this bot (fires on every /setrole
+# tap), so it gets its own proactive token bucket here instead of relying solely on
+# reactive RetryAfter handling. 25/sec, not 30/sec: leaves headroom under Telegram's
+# real 30 req/sec global cap for the non-ephemeral calls AIORateLimiter throttles
+# separately (get_chat_member, set_chat_administrator_custom_title, the wrapped
+# set_chat_member_tag path) -- see raw_api()'s docstring for why this is an
+# approximation, not a joint guarantee.
+_RAW_API_LIMITER = AsyncLimiter(25, 1)
+
+
 async def raw_api(bot, method: str, params: dict):
     """Call a Bot API method PTB hasn't wrapped yet. Bot._post serializes
     TelegramObject values (e.g. reply_markup=InlineKeyboardMarkup(...)) the
     same way every wrapped method does internally, and returns the decoded
     `result` JSON as-is (dict/list/bool) -- no Message/BotCommand typing.
+
+    _RAW_API_LIMITER and AIORateLimiter's own overall_max_rate limiter are two
+    separate token buckets drawing from the same underlying Telegram-side 30/sec
+    budget -- they're additive, not jointly enforced. Under worst-case concurrency
+    (this path and the AIORateLimiter-covered calls both saturated at once),
+    combined output could exceed 30/sec; the RetryAfter handling already in place
+    at every call site is the backstop for that gap, not something this replaces.
     """
-    return await bot._post(method, params)
+    async with _RAW_API_LIMITER:
+        return await bot._post(method, params)
 
 
 async def register_commands(app: Application) -> None:
@@ -216,15 +261,29 @@ async def cleanup_ephemeral(context: ContextTypes.DEFAULT_TYPE) -> None:
             "deleteEphemeralMessage",
             {"chat_id": chat_id, "receiver_user_id": receiver_user_id, "ephemeral_message_id": eid},
         )
-    except (BadRequest, Forbidden) as e:
+    except (BadRequest, Forbidden, RetryAfter) as e:
         logger.warning("couldn't delete stray ephemeral picker %s: %s", eid, e)
+
+
+async def _fallback_retry_notice(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Best-effort plain DM telling the user to retry -- used when the ephemeral
+    picker itself couldn't be delivered (flood limit, transient error), so the
+    failure is never silent even though AIORateLimiter already retried once."""
+    try:
+        await context.bot.send_message(
+            user_id, "দুঃখিত, এই মুহূর্তে সিস্টেম ব্যস্ত। কিছুক্ষণ পর /setrole আবার চেষ্টা করুন।"
+        )
+    except (BadRequest, Forbidden, RetryAfter):
+        pass
 
 
 async def send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, markup: InlineKeyboardMarkup) -> int:
     """Send the department picker. Ephemeral (receiver_user_id) inside the
     group so only the tapper sees it; a normal DM reply in private chats.
     Must stay fast and blocking-call-free -- Telegram only accepts the
-    ephemeral reply within 15s of the triggering command.
+    ephemeral reply within 15s of the triggering command. AIORateLimiter
+    (max_retries=1) already retries once on RetryAfter before this sees it,
+    so any exception/failure here means that retry didn't help either.
     """
     chat, user = update.effective_chat, update.effective_user
     if not _is_group(chat):
@@ -237,13 +296,15 @@ async def send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
             "sendMessage",
             {"chat_id": chat.id, "receiver_user_id": user.id, "text": text, "reply_markup": markup},
         )
-    except (BadRequest, Forbidden) as e:
-        logger.warning("ephemeral picker failed to deliver to %s: %s", user.id, e)  # e.g. user offline
+    except (BadRequest, Forbidden, RetryAfter) as e:
+        logger.warning("ephemeral picker failed to deliver to %s: %s", user.id, e)  # e.g. user offline, still rate limited
+        await _fallback_retry_notice(context, user.id)
         return ConversationHandler.END
 
     eid = result.get("ephemeral_message_id") if isinstance(result, dict) else 0
     if not eid:
         logger.warning("sendMessage returned no ephemeral_message_id for user %s: %r", user.id, result)
+        await _fallback_retry_notice(context, user.id)
         return ConversationHandler.END
     context.user_data["ephemeral_message_id"] = eid
     context.user_data["ephemeral_chat_id"] = chat.id
@@ -251,28 +312,41 @@ async def send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     return SELECT_DEPARTMENT
 
 
-async def edit_picker(query, context: ContextTypes.DEFAULT_TYPE, text: str, markup: InlineKeyboardMarkup | None) -> None:
-    """Edit the in-flight picker/confirmation, ephemeral or plain to match how it was sent."""
+async def edit_picker(query, context: ContextTypes.DEFAULT_TYPE, text: str, markup: InlineKeyboardMarkup | None) -> bool:
+    """Edit the in-flight picker/confirmation, ephemeral or plain to match how it was sent.
+    Returns False (instead of raising) on flood/permission/network failure, so callers whose
+    flow depends on the edit landing (e.g. on_department switching to the role keyboard) can
+    fail the conversation gracefully instead of leaving the user stuck on stale buttons.
+    """
     eid = context.user_data.get("ephemeral_message_id")
     if not eid:
-        await query.edit_message_text(text, reply_markup=markup)
-        return
+        try:
+            await query.edit_message_text(text, reply_markup=markup)
+        except (BadRequest, Forbidden, RetryAfter) as e:
+            logger.warning("couldn't edit picker for %s: %s", query.from_user.id, e)
+            return False
+        return True
 
     chat_id = context.user_data["ephemeral_chat_id"]
     receiver_user_id = context.user_data["ephemeral_user_id"]
     # text always changes here; markup=None means "clear the keyboard", not "skip the text",
     # so this always needs editEphemeralMessageText (pass an empty markup to drop the buttons).
-    await raw_api(
-        context.bot,
-        "editEphemeralMessageText",
-        {
-            "chat_id": chat_id,
-            "receiver_user_id": receiver_user_id,
-            "ephemeral_message_id": eid,
-            "text": text,
-            "reply_markup": markup or InlineKeyboardMarkup([]),
-        },
-    )
+    try:
+        await raw_api(
+            context.bot,
+            "editEphemeralMessageText",
+            {
+                "chat_id": chat_id,
+                "receiver_user_id": receiver_user_id,
+                "ephemeral_message_id": eid,
+                "text": text,
+                "reply_markup": markup or InlineKeyboardMarkup([]),
+            },
+        )
+    except (BadRequest, Forbidden, RetryAfter) as e:
+        logger.warning("couldn't edit ephemeral picker %s for %s: %s", eid, receiver_user_id, e)
+        return False
+    return True
 
 
 async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -310,7 +384,7 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await context.bot.send_message(
             new.user.id, "আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ। আপনার বিভাগ কোনটি?", reply_markup=department_keyboard()
         )
-    except Forbidden:
+    except (Forbidden, RetryAfter):
         return ConversationHandler.END  # ponytail: user never DM'd the bot, they can run /setrole later
     return SELECT_DEPARTMENT
 
@@ -319,7 +393,14 @@ async def on_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     query = update.callback_query
     await query.answer()
     dept = DEPT_CODES[int(query.data.split(":", 1)[1])]
-    await edit_picker(query, context, f"বিভাগ: {DEPARTMENTS[dept][0]}। আপনার দায়িত্ব কি?:", role_keyboard(dept))
+    ok = await edit_picker(query, context, f"বিভাগ: {DEPARTMENTS[dept][0]}। আপনার দায়িত্ব কি?:", role_keyboard(dept))
+    if not ok:
+        # buttons on screen are still the stale department picker, but the conversation
+        # would otherwise move to SELECT_ROLE where those callback_data values don't match
+        # any handler -- end it cleanly instead of leaving the user stuck.
+        await cleanup_ephemeral(context)
+        await _fallback_retry_notice(context, query.from_user.id)
+        return ConversationHandler.END
     return SELECT_ROLE
 
 
@@ -344,6 +425,10 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
     user = query.from_user
     try:
         member = await context.bot.get_chat_member(TARGET_GROUP_ID, user.id)
+    except RetryAfter as e:
+        logger.warning("rate limited checking membership for %s: %s", user.id, e)
+        await edit_picker(query, context, RATE_LIMIT_MSG, None)
+        return
     except (BadRequest, Forbidden):
         member = None
     is_member = member is not None and (
@@ -368,10 +453,16 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
             await context.bot.set_chat_member_tag(TARGET_GROUP_ID, user.id, tag)
         else:
             # ponytail: installed PTB predates the wrapped method, hit the raw API
-            await context.bot._post(
+            # (routed through raw_api() so it's covered by _RAW_API_LIMITER too)
+            await raw_api(
+                context.bot,
                 "setChatMemberTag",
                 {"chat_id": TARGET_GROUP_ID, "user_id": user.id, "tag": tag},
             )
+    except RetryAfter as e:
+        logger.warning("rate limited tagging %s: %s", user.id, e)
+        await edit_picker(query, context, RATE_LIMIT_MSG, None)
+        return
     except Forbidden:
         await edit_picker(
             query, context, "আমি ট্যাগ যুক্ত করতে পারছি না। এডমিনকে বলুন আমাকে can_manage_tags পার্মিশন দিতে।.", None
@@ -381,11 +472,11 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
         if "chat_creator_required" in str(e).lower():
             try:
                 await context.bot.set_chat_administrator_custom_title(TARGET_GROUP_ID, user.id, tag)
-            except (BadRequest, Forbidden) as title_err:
+            except (BadRequest, Forbidden, RetryAfter) as title_err:
                 logger.info("admin custom title fallback failed for %s: %s", user.id, title_err)
             else:
                 if tag:
-                    save_member(user, dept, role_label)
+                    await save_member(user, dept, role_label)
                     await edit_picker(query, context, f"জাজাকাল্লাহু খাইর। আপনার বর্তমান টাইটেল: {tag}", None)
                 else:
                     await edit_picker(query, context, "টাইটেল রিমোভ করা হয়েছে।", None)
@@ -402,12 +493,12 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
     if is_admin:
         try:
             await context.bot.set_chat_administrator_custom_title(TARGET_GROUP_ID, user.id, tag)
-        except (BadRequest, Forbidden) as e:
+        except (BadRequest, Forbidden, RetryAfter) as e:
             # ponytail: expected for admins/owner not promoted by this bot, Telegram rejects it outright
             logger.info("admin custom title sync skipped for %s: %s", user.id, e)
 
     if tag:
-        save_member(user, dept, role_label)
+        await save_member(user, dept, role_label)
         await edit_picker(query, context, f"জাজাকাল্লাহু খাইর। আপনার বর্তমান ট্যাগ: {tag}", None)
     else:
         await edit_picker(query, context, "ট্যাগ রিমোভ করা হয়েছে।", None)
@@ -455,7 +546,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "আপনি গ্রুপের সদস্য নন। গ্রুপ এডমিনের সাথে যোগাযোগ করুন।"
         )
         return
-    stored = get_member(user.id)
+    stored = await get_member(user.id)
     if stored:
         await update.effective_message.reply_text(
             f"আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ! আপনার বর্তমান ট্যাগ: {build_tag(*stored)}। "
@@ -476,14 +567,73 @@ async def mytag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     tag = getattr(member, "tag", None)
     if not tag:
-        stored = get_member(user.id)
+        stored = await get_member(user.id)
         tag = build_tag(*stored) if stored else None
     await update.effective_message.reply_text(f"আপনার ট্যাগ: {tag}" if tag else "আপনার ট্যাগ এখনো যুক্ত করা হয়নি। /setrole কমান্ড ব্যবহার করুন।")
 
 
+class PerUserUpdateProcessor(BaseUpdateProcessor):
+    """Lets different users' updates run concurrently (up to max_concurrent_updates in
+    flight) but serializes updates from the *same* user.
+
+    ConversationHandler here uses per_chat=False/per_user=True, so its state key is just
+    the user id -- but that only decides which bucket an update belongs to, it doesn't
+    serialize access to that bucket. ConversationHandler._conversations is a plain dict:
+    check_update() reads the current state synchronously, and the state write
+    (_update_state) only happens after the matched handler's callback has awaited its
+    Telegram API calls. Under concurrent_updates, two updates from the same user in
+    flight at once (double-tapped button, redelivered update, impatient /setrole retry)
+    would both read the same pre-update state and could both act on it -- e.g. two
+    picker messages, or apply_tag running twice. Different users don't share a state key,
+    so they don't race each other; only same-user in-flight overlap does, and this lock
+    closes exactly that gap without touching the ConversationHandler flow itself.
+    ponytail: per-user asyncio.Lock, dict grows with distinct users seen (fine at this
+    bot's scale); add TTL/LRU eviction if the member base grows into the tens of thousands.
+    """
+
+    def __init__(self, max_concurrent_updates: int) -> None:
+        super().__init__(max_concurrent_updates)
+        self._user_locks: dict[int, asyncio.Lock] = {}
+
+    async def do_process_update(self, update: object, coroutine: Awaitable) -> None:
+        user = update.effective_user if isinstance(update, Update) else None
+        if user is None:
+            await coroutine
+            return
+        lock = self._user_locks.setdefault(user.id, asyncio.Lock())
+        async with lock:
+            await coroutine
+
+    async def initialize(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
+
 def main() -> None:
     init_db()
-    app = Application.builder().token(BOT_TOKEN).post_init(register_commands).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        # group_max_rate=0: AIORateLimiter's default (20/min) is keyed by chat_id, and every
+        # ephemeral picker uses the same TARGET_GROUP_ID chat_id even though each one is only
+        # visible to one user -- so the default would cap the whole bot at ~20 pickers/minute
+        # regardless of how many distinct users are tapping /setrole. We don't know Telegram's
+        # real server-side flood limit for receiver-scoped ephemeral sends (Bot API 10.2 is very
+        # new), so rather than guess a number, disable the self-imposed per-chat cap and rely on
+        # the real overall_max_rate (30/s, matches Telegram's actual global cap) plus genuine
+        # RetryAfter from Telegram -- which max_retries=1 now retries once, and every call site
+        # below falls back to a user-facing message if that retry isn't enough.
+        .rate_limiter(AIORateLimiter(max_retries=1, group_max_rate=0))
+        # 64: high enough that 100 users tapping /setrole around the same time aren't queued
+        # behind each other (each handler is I/O-bound: a couple Telegram calls + one to_thread
+        # DB call), low enough not to open hundreds of tasks/DB-threadpool-slots at once.
+        # PerUserUpdateProcessor still serializes any single user's own updates -- see above.
+        .concurrent_updates(PerUserUpdateProcessor(64))
+        .post_init(register_commands)
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[
