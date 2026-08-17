@@ -295,6 +295,11 @@ async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_chat.id != TARGET_GROUP_ID:
         return ConversationHandler.END
+
+    actor = update.chat_member.from_user
+    if actor and actor.id == context.bot.id:
+        return ConversationHandler.END  # bot-caused change (e.g. setChatMemberTag), not a real join
+
     old, new = update.chat_member.old_chat_member, update.chat_member.new_chat_member
     if new.status not in ("member", "administrator") or old.status == new.status:
         return ConversationHandler.END
@@ -314,7 +319,7 @@ async def on_department(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     query = update.callback_query
     await query.answer()
     dept = DEPT_CODES[int(query.data.split(":", 1)[1])]
-    await edit_picker(query, context, f"{DEPARTMENTS[dept][0]} — pick your role:", role_keyboard(dept))
+    await edit_picker(query, context, f"বিভাগ: {DEPARTMENTS[dept][0]}। আপনার দায়িত্ব কি?:", role_keyboard(dept))
     return SELECT_ROLE
 
 
