@@ -474,6 +474,21 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
                 await context.bot.set_chat_administrator_custom_title(TARGET_GROUP_ID, user.id, tag)
             except (BadRequest, Forbidden, RetryAfter) as title_err:
                 logger.info("admin custom title fallback failed for %s: %s", user.id, title_err)
+                # Telegram's real restriction here differs by who the target is, not just
+                # "creator_required" -- the earlier setChatMemberTag error text is the same
+                # fixed string for both, so branch on actual status to give accurate guidance
+                # instead of always blaming the owner.
+                if member.status == "creator":
+                    msg = (
+                        "টেলিগ্রামের রেস্ট্রিকশনের কারণে গ্রুপ owner-এর কাস্টম টাইটেল বট দিয়ে পরিবর্তন করা যায় না। "
+                        "owner নিজে গ্রুপ সেটিংস থেকে নিজের টাইটেল পরিবর্তন করতে পারবেন।"
+                    )
+                else:
+                    msg = (
+                        "অন্য একজন এডমিন আপনাকে প্রোমোট করেছেন বলে আমি আপনার কাস্টম টাইটেল পরিবর্তন করতে পারছি না। "
+                        "যিনি আপনাকে এডমিন বানিয়েছেন তাকে অনুরোধ করুন আপনার টাইটেল পরিবর্তন করে দিতে।"
+                    )
+                await edit_picker(query, context, msg, None)
             else:
                 if tag:
                     await save_member(user, dept, role_label)
@@ -481,11 +496,6 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
                 else:
                     await edit_picker(query, context, "টাইটেল রিমোভ করা হয়েছে।", None)
                 return
-            await edit_picker(
-                query, context,
-                "টেলিগ্রামের রেস্ট্রিকশনের কারণে গ্রুপ owner এর ট্যাগ যুক্ত করতে পারছি না। গ্রুপ owner ম্যানুয়ালি নিজের ট্যাগ যুক্ত করতে পারবেন।",
-                None,
-            )
         else:
             await edit_picker(query, context, f"টেলিগ্রাম এই ট্যাগটি রিজেক্ট করেছে: {e}", None)
         return
