@@ -109,6 +109,7 @@ RECENTLY_TAGGED: dict[int, float] = {}
 RECENT_TAG_WINDOW = 10  # seconds
 EPHEMERAL_COMMANDS = {"setrole": True, "cancel": True, "mytag": True, "start": True}
 RATE_LIMIT_MSG = "টেলিগ্রাম এই মুহূর্তে ব্যস্ত। কিছুক্ষণ পর /setrole আবার চেষ্টা করুন।"
+NON_MEMBER_MSG = "আপনি গ্রুপের সদস্য নন। গ্রুপ এডমিনের সাথে যোগাযোগ করুন।"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -367,6 +368,9 @@ async def edit_picker(query, context: ContextTypes.DEFAULT_TYPE, text: str, mark
 
 
 async def setrole(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await is_group_member(context.bot, TARGET_GROUP_ID, update.effective_user.id):
+        await update.effective_message.reply_text(NON_MEMBER_MSG)
+        return ConversationHandler.END
     # The incoming /setrole command can itself be an ephemeral command;
     # PTB doesn't model that field, so read it from the raw update payload.
     incoming_eid = update.message.api_kwargs.get("ephemeral_message_id", 0) if update.message else 0
@@ -458,13 +462,7 @@ async def apply_tag(query, context, dept: str, tag: str, role_label: str) -> Non
     is_admin = member is not None and member.status in ("creator", "administrator")
 
     if not is_member:
-        await edit_picker(
-            query,
-            context,
-            "আপনি গ্রুপের সদস্য নন।"
-            "গ্রুপ এডমিনের সাথে যোগাযোগ করুন। ",
-            None,
-        )
+        await edit_picker(query, context, NON_MEMBER_MSG, None)
         return
 
     RECENTLY_TAGGED[user.id] = time.monotonic()
@@ -559,6 +557,9 @@ async def on_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await is_group_member(context.bot, TARGET_GROUP_ID, update.effective_user.id):
+        await update.effective_message.reply_text(NON_MEMBER_MSG)
+        return ConversationHandler.END
     await cleanup_ephemeral(context)
     await update.effective_message.reply_text("Cancelled.")
     return ConversationHandler.END
@@ -572,9 +573,7 @@ async def on_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not await is_group_member(context.bot, TARGET_GROUP_ID, user.id):
-        await update.effective_message.reply_text(
-            "আপনি গ্রুপের সদস্য নন। গ্রুপ এডমিনের সাথে যোগাযোগ করুন।"
-        )
+        await update.effective_message.reply_text(NON_MEMBER_MSG)
         return
     stored = await get_member(user.id)
     if stored:
@@ -593,7 +592,14 @@ async def mytag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         member = await context.bot.get_chat_member(TARGET_GROUP_ID, user.id)
     except (BadRequest, Forbidden) as e:
-        await update.effective_message.reply_text(f"Error! Couldn't look you up: {e}")
+        logger.info("membership check failed for %s: %s", user.id, e)
+        member = None
+    is_member = member is not None and (
+        member.status in ("creator", "administrator", "member")
+        or (member.status == "restricted" and member.is_member)
+    )
+    if not is_member:
+        await update.effective_message.reply_text(NON_MEMBER_MSG)
         return
     tag = getattr(member, "tag", None)
     if not tag:
