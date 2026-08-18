@@ -201,34 +201,18 @@ def role_keyboard(dept: str) -> InlineKeyboardMarkup:
 
 # --- raw Bot API 10.2 ephemeral-message stubs (not wrapped by PTB 22.8) ----
 
-# AIORateLimiter (attached in main()) only wraps ExtBot's individually-implemented
-# methods (send_message, get_chat_member, ...) via Bot._do_post -- it does not see
-# bot._post() called directly, which is exactly what raw_api() does for every
-# ephemeral call. That's the highest-volume path in this bot (fires on every /setrole
-# tap), so it gets its own proactive token bucket here instead of relying solely on
-# reactive RetryAfter handling. 25/sec, not 30/sec: leaves headroom under Telegram's
-# real 30 req/sec global cap for the non-ephemeral calls AIORateLimiter throttles
-# separately (get_chat_member, set_chat_administrator_custom_title, the wrapped
-# set_chat_member_tag path) -- see raw_api()'s docstring for why this is an
-# approximation, not a joint guarantee.
+# ExtBot._do_post() routes every bot._post() call (named methods AND raw calls like
+# this one, everything except getUpdates) through self.rate_limiter.process_request()
+# automatically -- confirmed by reading the installed PTB 22.8 source directly, not
+# assumed. So raw_api() doesn't need its own wrap; it already shares _base_limiter
+# with every other call the moment _make_rate_limiter() points _base_limiter at this
+# instance. overall_max_rate=0 on AIORateLimiter's own construction just prevents it
+# from building a second, separate bucket that raw_api() would otherwise never use.
 _RAW_API_LIMITER = AsyncLimiter(25, 1)
 
-
 async def raw_api(bot, method: str, params: dict):
-    """Call a Bot API method PTB hasn't wrapped yet. Bot._post serializes
-    TelegramObject values (e.g. reply_markup=InlineKeyboardMarkup(...)) the
-    same way every wrapped method does internally, and returns the decoded
-    `result` JSON as-is (dict/list/bool) -- no Message/BotCommand typing.
-
-    _RAW_API_LIMITER and AIORateLimiter's own overall_max_rate limiter are two
-    separate token buckets drawing from the same underlying Telegram-side 30/sec
-    budget -- they're additive, not jointly enforced. Under worst-case concurrency
-    (this path and the AIORateLimiter-covered calls both saturated at once),
-    combined output could exceed 30/sec; the RetryAfter handling already in place
-    at every call site is the backstop for that gap, not something this replaces.
-    """
-    async with _RAW_API_LIMITER:
-        return await bot._post(method, params)
+    """... rate-limited via ExtBot._do_post -> shared _base_limiter, no separate wrap needed."""
+    return await bot._post(method, params)
 
 
 async def register_commands(app: Application) -> None:
@@ -277,6 +261,34 @@ async def _fallback_retry_notice(context: ContextTypes.DEFAULT_TYPE, user_id: in
         pass
 
 
+async def _contain_public_leak(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, user_id: int) -> None:
+    """A picker meant for `user_id` alone (Bot API 10.2 ephemeral send) came back
+    without ephemeral_message_id but WITH a normal message_id -- Telegram accepted
+    it as a plain PUBLIC message in the group instead. That message is live right
+    now and visible to everyone in the group. This is a privacy incident, not an
+    ordinary delivery failure, so it gets its own loud, greppable log line instead
+    of folding into the generic warning -- and we delete the leaked message before
+    doing anything else.
+
+    Uses the wrapped delete_message (not raw_api) on purpose: it goes through
+    AIORateLimiter, which auto-retries once on RetryAfter (max_retries=1 in
+    main()) -- the same rate-limited conditions that caused the leak are exactly
+    the conditions where the delete itself is most likely to also get throttled,
+    so the path with a built-in retry is the more reliable one here.
+    """
+    logger.error(
+        "PRIVACY LEAK: ephemeral picker for user %s posted as PUBLIC message_id=%s in chat %s -- deleting now",
+        user_id, message_id, chat_id,
+    )
+    try:
+        await context.bot.delete_message(chat_id, message_id)
+    except (BadRequest, Forbidden, RetryAfter) as e:
+        logger.critical(
+            "PRIVACY LEAK UNCONTAINED: could not delete leaked picker message_id=%s in chat %s for user %s: %s",
+            message_id, chat_id, user_id, e,
+        )
+
+
 async def send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, markup: InlineKeyboardMarkup) -> int:
     """Send the department picker. Ephemeral (receiver_user_id) inside the
     group so only the tapper sees it; a normal DM reply in private chats.
@@ -303,7 +315,12 @@ async def send_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
 
     eid = result.get("ephemeral_message_id") if isinstance(result, dict) else 0
     if not eid:
-        logger.warning("sendMessage returned no ephemeral_message_id for user %s: %r", user.id, result)
+        message_id = result.get("message_id") if isinstance(result, dict) else None
+        if message_id:
+            # Telegram sent something, just not ephemerally -- it's live in the group now.
+            await _contain_public_leak(context, chat.id, message_id, user.id)
+        else:
+            logger.warning("sendMessage returned no ephemeral_message_id for user %s: %r", user.id, result)
         await _fallback_retry_notice(context, user.id)
         return ConversationHandler.END
     context.user_data["ephemeral_message_id"] = eid
@@ -381,6 +398,9 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if tagged_at is not None and time.monotonic() - tagged_at < RECENT_TAG_WINDOW:
         return ConversationHandler.END
     try:
+        # Exempt from the send_picker leak: chat_id here is new.user.id (a private DM chat),
+        # never TARGET_GROUP_ID -- there is no group message for Telegram to mis-deliver
+        # publicly, ephemeral or otherwise. This never goes through raw_api()/send_picker.
         await context.bot.send_message(
             new.user.id, "আসসালামু আলাইকুম ওয়া রাহমাতুল্লাহ। আপনার বিভাগ কোনটি?", reply_markup=department_keyboard()
         )
@@ -621,21 +641,34 @@ class PerUserUpdateProcessor(BaseUpdateProcessor):
         pass
 
 
+def _make_rate_limiter() -> AIORateLimiter:
+    # group_max_rate=0: AIORateLimiter's default (20/min) is keyed by chat_id, and every
+    # ephemeral picker uses the same TARGET_GROUP_ID chat_id even though each one is only
+    # visible to one user -- so the default would cap the whole bot at ~20 pickers/minute
+    # regardless of how many distinct users are tapping /setrole. We don't know Telegram's
+    # real server-side flood limit for receiver-scoped ephemeral sends (Bot API 10.2 is very
+    # new), so rather than guess a number, disable the self-imposed per-chat cap and rely on
+    # the shared overall bucket (see _RAW_API_LIMITER) plus genuine RetryAfter from Telegram --
+    # which max_retries=1 now retries once, and every call site below falls back to a
+    # user-facing message if that retry isn't enough.
+    #
+    # overall_max_rate=0 disables AIORateLimiter's own internal AsyncLimiter (it would
+    # otherwise build a second, independent 30/s bucket); _base_limiter is then pointed at
+    # _RAW_API_LIMITER below so this and raw_api() share one real token bucket instead of two
+    # additive ones. _base_limiter is a declared __slot__ on AIORateLimiter (checked against
+    # installed PTB 22.8's telegram/ext/_aioratelimiter.py), not a property, so plain
+    # assignment after construction is exactly how the class's own __init__ sets it.
+    limiter = AIORateLimiter(max_retries=1, group_max_rate=0, overall_max_rate=0)
+    limiter._base_limiter = _RAW_API_LIMITER
+    return limiter
+
+
 def main() -> None:
     init_db()
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        # group_max_rate=0: AIORateLimiter's default (20/min) is keyed by chat_id, and every
-        # ephemeral picker uses the same TARGET_GROUP_ID chat_id even though each one is only
-        # visible to one user -- so the default would cap the whole bot at ~20 pickers/minute
-        # regardless of how many distinct users are tapping /setrole. We don't know Telegram's
-        # real server-side flood limit for receiver-scoped ephemeral sends (Bot API 10.2 is very
-        # new), so rather than guess a number, disable the self-imposed per-chat cap and rely on
-        # the real overall_max_rate (30/s, matches Telegram's actual global cap) plus genuine
-        # RetryAfter from Telegram -- which max_retries=1 now retries once, and every call site
-        # below falls back to a user-facing message if that retry isn't enough.
-        .rate_limiter(AIORateLimiter(max_retries=1, group_max_rate=0))
+        .rate_limiter(_make_rate_limiter())
         # 64: high enough that 100 users tapping /setrole around the same time aren't queued
         # behind each other (each handler is I/O-bound: a couple Telegram calls + one to_thread
         # DB call), low enough not to open hundreds of tasks/DB-threadpool-slots at once.
