@@ -680,7 +680,7 @@ def main() -> None:
 
     conv = ConversationHandler(
         entry_points=[
-            CommandHandler("setrole", setrole),
+            CommandHandler("setrole", setrole, filters=filters.ChatType.PRIVATE),
             ChatMemberHandler(on_join, ChatMemberHandler.CHAT_MEMBER),
         ],
         states={
@@ -691,13 +691,16 @@ def main() -> None:
             ],
             ConversationHandler.TIMEOUT: [CallbackQueryHandler(on_timeout), MessageHandler(filters.ALL, on_timeout)],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("setrole", setrole)],
+        fallbacks=[
+            CommandHandler("cancel", cancel, filters=filters.ChatType.PRIVATE),
+            CommandHandler("setrole", setrole, filters=filters.ChatType.PRIVATE),
+        ],
         per_chat=False,  # join event fires in the group chat, replies happen in DM -- track by user only
         conversation_timeout=CONVERSATION_TIMEOUT,
     )
     app.add_handler(conv)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("mytag", mytag))
+    app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("mytag", mytag, filters=filters.ChatType.PRIVATE))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
